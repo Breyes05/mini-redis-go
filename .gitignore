@@ -1,0 +1,5 @@
+/bin/
+/dist/
+*.aof
+*.rdb
+.DS_Store
