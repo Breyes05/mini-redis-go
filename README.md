@@ -42,27 +42,38 @@ the tradeoffs behind each of those in more depth than this README does.
   keys don't contend on the same lock ([details](docs/DESIGN.md#concurrency-sharded-locks-over-a-single-global-mutex))
 - **Key expiration** — both lazy (checked on read) and active (background
   sweep), matching how real Redis reclaims memory ([details](docs/DESIGN.md#expiration-lazy--active-not-just-one))
+- **Crash recovery via an append-only file (AOF)** — every mutating command
+  is logged to disk (in the same RESP format used on the wire) before the
+  client is told it succeeded, and replayed on startup to rebuild state
+  ([details](docs/DESIGN.md#persistence-append-only-file))
 - **Commands implemented:** `PING`, `ECHO`, `SET` (with `EX` seconds),
   `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`
 
 ## Architecture
 
 ```
-┌────────────┐   RESP over TCP    ┌───────────────────────────────┐
-│ redis-cli /│ ──────────────────▶│ Server (1 goroutine/connection)│
-│ any client │◀────────────────── │        │                       │
-└────────────┘                    │        ▼                       │
-                                   │  Command dispatcher            │
-                                   │        │                       │
-                                   │        ▼                       │
-                                   │  Sharded store (16 shards,     │
-                                   │  RWMutex per shard) ◀───┐      │
-                                   │        ▲                │      │
-                                   │        │                │      │
-                                   │  Active expiry sweep ───┘      │
-                                   │  (background goroutine,        │
-                                   │   ticks every 100ms)           │
-                                   └───────────────────────────────┘
+┌────────────┐   RESP over TCP    ┌────────────────────────────────────┐
+│ redis-cli /│ ──────────────────▶│ Server (1 goroutine/connection)     │
+│ any client │◀────────────────── │        │                            │
+└────────────┘                    │        ▼                            │
+                                   │  Command dispatcher                 │
+                                   │        │                            │
+                                   │        ▼                            │
+                                   │  Sharded store (16 shards,          │
+                                   │  RWMutex per shard) ◀───┐           │
+                                   │        │  ▲              │           │
+                                   │        │  │        Active expiry    │
+                                   │        │  └──────  sweep (100ms     │
+                                   │        │            background      │
+                                   │        │            goroutine)      │
+                                   │        ▼                            │
+                                   │  AOF: append mutating commands      │
+                                   │  to disk (RESP-encoded), before     │
+                                   │  the client's reply is sent         │
+                                   └────────────────┬────────────────────┘
+                                                     │ replayed on startup
+                                                     ▼
+                                          appendonly.aof (disk)
 ```
 
 ## Getting started
@@ -74,6 +85,18 @@ git clone https://github.com/Breyes05/mini-redis-go.git
 cd mini-redis-go
 make run          # builds and starts the server on :6380
 ```
+
+By default the server logs writes to `appendonly.aof` in the working
+directory and replays it on startup, so state survives a restart:
+
+```bash
+./bin/mini-redis-go -addr :6380 -aof appendonly.aof -fsync everysec
+```
+
+- `-aof ""` disables persistence entirely (pure in-memory, like milestone 1)
+- `-fsync always` syncs to disk after every write (durable, slower);
+  `-fsync everysec` (default) batches syncs once a second, matching Redis's
+  own default — see [the tradeoff writeup](docs/DESIGN.md#persistence-append-only-file)
 
 Talk to it with `redis-cli` if you have it installed:
 
@@ -102,10 +125,11 @@ make race    # same, with the race detector
 ## Project layout
 
 ```
-cmd/server/          entry point (flag parsing, wiring)
-internal/resp/        RESP protocol reader + writer
-internal/store/       sharded in-memory keyspace with TTL support
-internal/server/      TCP server + command dispatch
+cmd/server/            entry point (flag parsing, wiring, replay-then-serve)
+internal/resp/         RESP protocol reader + writer
+internal/store/        sharded in-memory keyspace with TTL support
+internal/server/       TCP server + command dispatch
+internal/persistence/  append-only file: log writer + startup replay
 docs/DESIGN.md         deeper design rationale and tradeoffs
 ```
 
@@ -127,7 +151,7 @@ docs/DESIGN.md         deeper design rationale and tradeoffs
 This was scoped as a multi-weekend project; commands/storage above are
 milestone 1. Next up, in order:
 
-- [ ] **Persistence** — append-only file (AOF) writer + replay on startup
+- [x] **Persistence** — append-only file (AOF) writer + replay on startup
 - [ ] **Replication** — single leader, N followers, full sync + streamed
       writes, with a reported replication offset
 - [ ] **Benchmarks** — throughput/latency numbers via `redis-benchmark`,

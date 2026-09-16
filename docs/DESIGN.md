@@ -49,10 +49,58 @@ between sweeps. Running both is what real Redis does, and combining them
 is the point: correctness from lazy checks, bounded memory from active
 sweeps.
 
+## Persistence: append-only file
+
+**The mechanism.** Every mutating command (`SET`, `DEL`, `EXPIRE` — never
+reads) is appended to a log file encoded exactly as it would be sent over
+the wire (a RESP array of bulk strings). On startup, before the server
+accepts any connections, that file is replayed by feeding each logged
+command back through the *same* `dispatch` function a live connection uses,
+just pointed at a discard writer instead of a socket. There is deliberately
+only one command-parsing/validation code path in the whole project — replay
+reuses it rather than reimplementing "apply a SET" a second time, which
+would be an easy place for the two to drift out of sync.
+
+**Ordering: mutate → log → respond.** Within each handler, the store is
+mutated first, then the command is appended to the AOF, and only then is
+the client's reply written. This means that by the time a client sees
+`+OK`, the command is already durably appended (subject to the fsync policy
+below) — the alternative ordering (respond, then log) would let a client
+believe a write succeeded when a crash in that gap could lose it entirely.
+The mutate-first-log-second choice does mean a crash between those two
+steps loses the write silently either way; a stricter design would log
+*before* mutating (a true write-ahead log) so the log is always authoritative
+even about writes that never reached memory. That's the natural next
+hardening step, deferred here because the store is the single source of
+truth for live reads regardless, and getting log-then-respond right already
+removes the main correctness gap.
+
+**Fsync policy — a configurable throughput/durability tradeoff.** Appending
+to the file's buffer and actually forcing it to disk (`fsync`) are
+different costs: an `fsync` is a real disk operation, potentially
+milliseconds, versus a buffered write that's essentially free. Two
+policies are implemented, both real Redis options:
+
+- `always` — fsync after every single command. Zero data loss on crash, but
+  every write now costs a disk sync.
+- `everysec` (default) — a background goroutine fsyncs on a 1-second timer;
+  writes in between are buffered. Bounds data loss to roughly the last
+  second, at negligible per-command cost. This is Redis's own default for
+  exactly this reason — most workloads would rather risk ~1s of writes than
+  pay a disk sync per command.
+
+**Why replay reuses `dispatch` instead of applying to the store directly.**
+It would be a little faster to write a second, storage-only "apply" path
+that skips RESP writer setup entirely. That's a real option, but it
+introduces a second place where "what does a SET actually do" is defined —
+if the two ever disagreed (e.g. someone adds `EX` validation to live `SET`
+and forgets the replay path), replayed state could silently diverge from
+what clients experienced before the crash. Reusing `dispatch` costs a
+throwaway `resp.Writer` around `io.Discard` per replayed command, which is
+irrelevant next to disk I/O.
+
 ## What's deliberately not built yet
 
-- **Persistence (AOF):** every write command appended to a log file,
-  replayed on restart to rebuild state. Next milestone.
 - **Replication:** single leader, N followers, full sync on connect then a
   streamed command log. The follower's replication offset gives a concrete
   "how far behind is this replica" number to report.

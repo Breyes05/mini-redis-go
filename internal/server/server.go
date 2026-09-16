@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Breyes05/mini-redis-go/internal/persistence"
 	"github.com/Breyes05/mini-redis-go/internal/resp"
 	"github.com/Breyes05/mini-redis-go/internal/store"
 )
@@ -21,10 +22,40 @@ import (
 type Server struct {
 	addr  string
 	store *store.Store
+	aof   *persistence.AOF // nil means persistence is disabled
 }
 
 func New(addr string, st *store.Store) *Server {
 	return &Server{addr: addr, store: st}
+}
+
+// SetAOF attaches an AOF log: every mutating command dispatched from this
+// point on is appended to it. Call this only after any startup replay is
+// done — logging while replaying the very file being replayed would corrupt
+// it.
+func (s *Server) SetAOF(aof *persistence.AOF) {
+	s.aof = aof
+}
+
+// Apply runs a single previously-logged command directly against the store,
+// discarding its response. This is how AOF replay rebuilds state on
+// startup: it reuses the exact same parsing and validation path a live
+// connection would go through (via dispatch), just with nowhere to send the
+// reply.
+func (s *Server) Apply(args []string) {
+	w := resp.NewWriter(bufio.NewWriter(io.Discard))
+	_ = s.dispatch(args, w)
+}
+
+// logToAOF appends a command that just mutated the store. It's a no-op
+// when persistence is disabled (s.aof == nil, e.g. during replay itself).
+func (s *Server) logToAOF(args []string) {
+	if s.aof == nil {
+		return
+	}
+	if err := s.aof.Append(args); err != nil {
+		log.Printf("aof: failed to append %v: %v", args, err)
+	}
 }
 
 // ListenAndServe binds addr and serves connections until it hits an error
@@ -100,6 +131,7 @@ func (s *Server) dispatch(args []string, w *resp.Writer) error {
 				n++
 			}
 		}
+		s.logToAOF(args)
 		return w.WriteInteger(n)
 	case "EXISTS":
 		if len(args) != 2 {
@@ -151,6 +183,7 @@ func (s *Server) handleSet(args []string, w *resp.Writer) error {
 		i++
 	}
 	s.store.Set(key, value, ttl)
+	s.logToAOF(args)
 	return w.WriteSimpleString("OK")
 }
 
@@ -167,5 +200,6 @@ func (s *Server) handleExpire(args []string, w *resp.Writer) error {
 		return w.WriteInteger(0)
 	}
 	s.store.Set(args[1], v, time.Duration(secs)*time.Second)
+	s.logToAOF(args)
 	return w.WriteInteger(1)
 }
