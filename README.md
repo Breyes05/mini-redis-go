@@ -32,7 +32,9 @@ about systems. This one is scoped specifically to surface that: a real
 binary protocol parser, a concurrency model that has to actually reason
 about lock contention, and a background process (expiry sweeping) running
 alongside request handling. The [design notes](docs/DESIGN.md) walk through
-the tradeoffs behind each of those in more depth than this README does.
+the tradeoffs behind each of those in more depth than this README does, and
+[engineering notes](docs/ENGINEERING_NOTES.md) collects decisions, bugs
+found, and tradeoffs in one skimmable reference.
 
 ## Features
 
