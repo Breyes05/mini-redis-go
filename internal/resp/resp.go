@@ -8,6 +8,7 @@ package resp
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -74,6 +75,28 @@ func (r *Reader) ReadCommand() ([]string, error) {
 		args[i] = item.Str
 	}
 	return args, nil
+}
+
+// EncodeCommand encodes args as a RESP array of bulk strings — the same
+// framing a client sends a command in. It's the one place that framing is
+// built outside of a live reply, so anything that needs to serialize a
+// command to bytes off the wire (the AOF log, the replication stream) goes
+// through this rather than re-implementing the encoding.
+func EncodeCommand(args []string) []byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(&buf, "$%d\r\n%s\r\n", len(a), a)
+	}
+	return buf.Bytes()
+}
+
+// ReadValue reads and returns one raw RESP value from the stream. Most
+// callers want ReadCommand instead; ReadValue is for the few places (like
+// the integer count that precedes a replication snapshot) that need to read
+// a reply-shaped value rather than a client command.
+func (r *Reader) ReadValue() (Value, error) {
+	return r.readValue()
 }
 
 // readInline consumes one line and splits it on whitespace, supporting

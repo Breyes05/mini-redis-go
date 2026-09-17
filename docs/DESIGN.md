@@ -99,11 +99,83 @@ what clients experienced before the crash. Reusing `dispatch` costs a
 throwaway `resp.Writer` around `io.Discard` per replayed command, which is
 irrelevant next to disk I/O.
 
+## Replication: leader-follower
+
+**The mechanism.** A follower dials the leader and sends `SYNC`. The leader
+registers it as a replica, takes a snapshot of the store, and sends the
+snapshot back as a count followed by that many `SET` commands — then keeps
+the connection open and streams every subsequent mutating command to it,
+indefinitely, as `propagate` (the same function that logs to the AOF) fans
+each one out. The follower applies everything it receives — snapshot
+entries and streamed commands alike — through `Server.Apply`, the same
+function AOF replay uses, so there is still only one definition of "what a
+command does" anywhere in the project.
+
+**The ordering bug this design has to avoid.** A snapshot is a
+point-in-time copy; live writes keep happening while it's being taken and
+sent. If a replica registered for the live stream *after* the snapshot was
+captured, any write that landed in that gap would be in neither the
+snapshot nor the stream — permanently lost, silently, with no error
+anywhere. The fix: **register for the live stream before taking the
+snapshot.** Concretely, `Hub.RegisterWithOffset` adds the replica's channel
+under the same lock it reads the current offset from, so no `Broadcast` can
+happen in between; only after that does `serveReplica` call
+`store.Snapshot()`. A write that lands in the (now harmless) gap between
+registering and snapshotting shows up in both the snapshot and the live
+stream — a duplicate `SET`/`DEL` of the same key/value, which is a no-op the
+second time. Duplicates are fine; missing writes are not, so the design
+optimizes for that asymmetry.
+
+**Making the replication offset actually mean something.** The leader's
+`Hub` counts total bytes broadcast since the *leader* started. A follower
+that connects later — after the leader has already broadcast some writes —
+would, if its own counter started at zero, never converge with the
+leader's number even once fully caught up. Real Redis solves this with its
+`PSYNC`/`FULLRESYNC` handshake: the leader tells the connecting replica what
+offset its snapshot corresponds to, and the replica's counter starts there
+instead of at zero. This project does the same thing in miniature — the
+snapshot header is `<baseOffset>\r\n<count>\r\n`, and the follower seeds its
+own counter with `baseOffset` before adding anything it streams
+afterward. The result: `REPLOFFSET` on a caught-up follower reports exactly
+what the leader reports, and the gap between them when it isn't caught up
+is a real, comparable measure of replication lag rather than an
+apples-to-oranges number.
+
+**Read-only followers, and how a "replicated write" avoids being rejected
+by that same rule.** A follower rejects `SET`/`DEL`/`EXPIRE` from ordinary
+clients (`READONLY You can't write against a read only replica.`), which
+means the one code path that mutates the store (`dispatch`) has to somehow
+allow writes that arrive *from the leader* while still rejecting writes
+from a normal connection. `dispatch` takes an `internal bool`: client
+connections always pass `false`; `Apply` (used by both AOF replay and the
+replication stream) always passes `true`, skipping the read-only check.
+The result is worth noticing: an ordinary write and a replicated write are
+almost the same operation and go through almost the same code, differing
+only in that one bit, rather than being two separate, divergent
+implementations of "how to run a command."
+
+**A side effect of reusing `propagate` for both AOF and replication: chained
+replication basically falls out for free.** Since `Apply` calls `dispatch`,
+and `dispatch`'s write handlers always call `propagate` regardless of the
+`internal` flag, a follower that itself has sub-replicas connected will
+re-broadcast (and, if configured, re-log to its own AOF) everything it
+applies from its own leader — without any code written specifically to
+support chaining. Untested (no test in this repo exercises three levels
+deep), but the mechanism is the same one the two-level case already relies
+on and exercises.
+
+**What's deliberately simplified.** No partial resync (`PSYNC` in real
+Redis can hand a reconnecting replica just what it missed, using a
+replication backlog buffer, instead of a full snapshot every time) — every
+reconnect here re-syncs from scratch. No replica acknowledgment tracking on
+the leader (real Redis's `WAIT` command blocks until N replicas confirm
+they've applied up to some offset); this project's replication is
+fire-and-forget from the leader's perspective — a slow or dead replica is
+simply dropped (see `Hub.Broadcast`) rather than causing backpressure on
+writes.
+
 ## What's deliberately not built yet
 
-- **Replication:** single leader, N followers, full sync on connect then a
-  streamed command log. The follower's replication offset gives a concrete
-  "how far behind is this replica" number to report.
 - **LRU eviction:** once a max-memory config exists, evict on write when
   over budget. Real Redis uses *approximated* LRU — sample a handful of
   random keys and evict the oldest of the sample, rather than maintaining an
@@ -116,7 +188,7 @@ See the [README roadmap](../README.md#roadmap) for the milestone order.
 
 ## Benchmarking plan
 
-Once persistence and replication land, the plan is to measure with
+With persistence and replication both in place, the plan is to measure with
 `redis-benchmark` (ships with real Redis) against this server:
 
 - Throughput (ops/sec) for `SET`/`GET` at increasing concurrency

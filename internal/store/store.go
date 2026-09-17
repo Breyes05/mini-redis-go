@@ -116,6 +116,40 @@ func (s *Store) TTL(key string) (remaining time.Duration, ok bool) {
 	return time.Until(e.expiresAt), true
 }
 
+// SnapshotEntry is one key's state as captured by Snapshot.
+type SnapshotEntry struct {
+	Key   string
+	Value string
+	TTL   time.Duration // remaining TTL; <= 0 means no expiry
+}
+
+// Snapshot returns every live (non-expired) key — used for replication's
+// full sync when a follower first connects. It locks one shard at a time
+// rather than the whole store for the duration of the copy, so a snapshot
+// in progress doesn't stall unrelated reads/writes on other shards the way
+// a single global lock would. (Real Redis instead forks a child process to
+// write an RDB snapshot from a copy-on-write view of memory — cheaper still,
+// but out of scope for this project.)
+func (s *Store) Snapshot() []SnapshotEntry {
+	now := time.Now()
+	var out []SnapshotEntry
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		for k, e := range sh.data {
+			if e.expired(now) {
+				continue
+			}
+			var ttl time.Duration
+			if !e.expiresAt.IsZero() {
+				ttl = e.expiresAt.Sub(now)
+			}
+			out = append(out, SnapshotEntry{Key: k, Value: e.value, TTL: ttl})
+		}
+		sh.mu.RUnlock()
+	}
+	return out
+}
+
 // activeExpiryLoop periodically sweeps every shard for expired keys.
 // Without this, a key that's set with a TTL and never read again would
 // linger in memory indefinitely — lazy expiry alone only reclaims a key at

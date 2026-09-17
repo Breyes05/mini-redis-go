@@ -46,14 +46,18 @@ the tradeoffs behind each of those in more depth than this README does.
   is logged to disk (in the same RESP format used on the wire) before the
   client is told it succeeded, and replayed on startup to rebuild state
   ([details](docs/DESIGN.md#persistence-append-only-file))
+- **Leader-follower replication** — a follower full-syncs on connect, then
+  streams live writes; both sides report a byte-for-byte comparable
+  replication offset, the same way real Redis's `FULLRESYNC` handshake
+  works ([details](docs/DESIGN.md#replication-leader-follower))
 - **Commands implemented:** `PING`, `ECHO`, `SET` (with `EX` seconds),
-  `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`
+  `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `REPLOFFSET`
 
 ## Architecture
 
 ```
 ┌────────────┐   RESP over TCP    ┌────────────────────────────────────┐
-│ redis-cli /│ ──────────────────▶│ Server (1 goroutine/connection)     │
+│ redis-cli /│ ──────────────────▶│ Leader (1 goroutine/connection)     │
 │ any client │◀────────────────── │        │                            │
 └────────────┘                    │        ▼                            │
                                    │  Command dispatcher                 │
@@ -67,13 +71,25 @@ the tradeoffs behind each of those in more depth than this README does.
                                    │        │            background      │
                                    │        │            goroutine)      │
                                    │        ▼                            │
-                                   │  AOF: append mutating commands      │
-                                   │  to disk (RESP-encoded), before     │
-                                   │  the client's reply is sent         │
-                                   └────────────────┬────────────────────┘
-                                                     │ replayed on startup
-                                                     ▼
-                                          appendonly.aof (disk)
+                                   │  propagate: AOF + replication hub   │
+                                   │        │              │             │
+                                   │        ▼              ▼             │
+                                   │  appendonly.aof   Hub.Broadcast     │
+                                   │  (disk)           to every          │
+                                   │                   connected         │
+                                   │                   replica           │
+                                   └────────────────────────┬───────────┘
+                                                             │ SYNC:
+                                                             │ full sync,
+                                                             │ then a live
+                                                             │ command
+                                                             │ stream
+                                                             ▼
+                              ┌───────────────────────────────────────┐
+                              │ Follower — replication.RunFollower     │
+                              │ applies each command via the same      │
+                              │ dispatch path (read-only to clients)   │
+                              └───────────────────────────────────────┘
 ```
 
 ## Getting started
@@ -114,6 +130,28 @@ PING
 +PONG
 ```
 
+### Running a leader + follower
+
+In one terminal, start a leader as usual. In another, point a second
+instance at it with `-replicaof`:
+
+```bash
+./bin/mini-redis-go -addr :6380                          # leader
+./bin/mini-redis-go -addr :6381 -aof follower.aof -replicaof 127.0.0.1:6380
+```
+
+The follower full-syncs immediately, then stays caught up with every write
+made against the leader. It still serves reads to ordinary clients, but
+rejects writes:
+
+```bash
+redis-cli -p 6380 SET foo bar     # OK — on the leader
+redis-cli -p 6381 GET foo         # "bar" — replicated
+redis-cli -p 6381 SET foo baz     # (error) READONLY You can't write against a read only replica.
+redis-cli -p 6380 REPLOFFSET      # bytes of writes broadcast so far
+redis-cli -p 6381 REPLOFFSET      # matches the leader's once caught up
+```
+
 Run the test suite (includes an end-to-end test that opens a real TCP
 connection and exchanges raw RESP bytes):
 
@@ -130,6 +168,7 @@ internal/resp/         RESP protocol reader + writer
 internal/store/        sharded in-memory keyspace with TTL support
 internal/server/       TCP server + command dispatch
 internal/persistence/  append-only file: log writer + startup replay
+internal/replication/  leader-side Hub (fan-out) + follower-side sync client
 docs/DESIGN.md         deeper design rationale and tradeoffs
 ```
 
@@ -145,6 +184,10 @@ docs/DESIGN.md         deeper design rationale and tradeoffs
 | `EXISTS` | `EXISTS key` | `1` or `0` |
 | `EXPIRE` | `EXPIRE key seconds` | Sets TTL on an existing key |
 | `TTL` | `TTL key` | Seconds left, `-1` if no TTL, `-2` if missing |
+| `REPLOFFSET` | `REPLOFFSET` | Bytes of replicated writes processed so far (not a real Redis command) |
+
+`SYNC` is also handled, but as an internal replica handshake rather than a
+client command — see [Running a leader + follower](#running-a-leader--follower).
 
 ## Roadmap
 
@@ -152,7 +195,7 @@ This was scoped as a multi-weekend project; commands/storage above are
 milestone 1. Next up, in order:
 
 - [x] **Persistence** — append-only file (AOF) writer + replay on startup
-- [ ] **Replication** — single leader, N followers, full sync + streamed
+- [x] **Replication** — single leader, N followers, full sync + streamed
       writes, with a reported replication offset
 - [ ] **Benchmarks** — throughput/latency numbers via `redis-benchmark`,
       published in this README once measured

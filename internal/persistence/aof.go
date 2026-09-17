@@ -65,16 +65,19 @@ func Open(path string, policy FsyncPolicy) (*AOF, error) {
 // format means Replay can reuse the same resp.Reader that parses live
 // connections — there's only one command parser in the whole codebase.
 func (a *AOF) Append(args []string) error {
+	return a.AppendEncoded(resp.EncodeCommand(args))
+}
+
+// AppendEncoded writes an already wire-encoded command to the log. It
+// exists so a caller that has already encoded the command for another
+// purpose (the server encodes once and both logs to the AOF and fans out to
+// replicas) doesn't have to pay for encoding it twice.
+func (a *AOF) AppendEncoded(encoded []byte) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if _, err := fmt.Fprintf(a.w, "*%d\r\n", len(args)); err != nil {
+	if _, err := a.w.Write(encoded); err != nil {
 		return err
-	}
-	for _, arg := range args {
-		if _, err := fmt.Fprintf(a.w, "$%d\r\n%s\r\n", len(arg), arg); err != nil {
-			return err
-		}
 	}
 	if err := a.w.Flush(); err != nil {
 		return err
