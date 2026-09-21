@@ -166,6 +166,7 @@ make race    # same, with the race detector
 
 ```
 cmd/server/            entry point (flag parsing, wiring, replay-then-serve)
+cmd/bench/             concurrent load generator used to produce the benchmark numbers below
 internal/resp/         RESP protocol reader + writer
 internal/store/        sharded in-memory keyspace with TTL support
 internal/server/       TCP server + command dispatch
@@ -191,6 +192,59 @@ docs/DESIGN.md         deeper design rationale and tradeoffs
 `SYNC` is also handled, but as an internal replica handshake rather than a
 client command — see [Running a leader + follower](#running-a-leader--follower).
 
+## Benchmarks
+
+Measured with [cmd/bench](cmd/bench) — a small load generator built for
+this project instead of requiring a separate install of real Redis's
+`redis-benchmark` (see [why](docs/DESIGN.md#benchmarking-methodology)).
+Every number below is real, reproducible output from an actual run, not an
+estimate. Machine: Apple M2 Pro, Go 1.25.3, client and server on the same
+machine over loopback — see the methodology note for what that does and
+doesn't tell you.
+
+**Throughput scales with concurrency** (persistence disabled, 50/50 GET/SET
+mix, 64-byte values, 100k requests):
+
+| Concurrency | Throughput | p50 latency | p99 latency |
+|---|---|---|---|
+| 1 | 46,099 ops/sec | 19µs | 59µs |
+| 10 | 77,295 ops/sec | 125µs | 239µs |
+| 50 | 134,841 ops/sec | 354µs | 896µs |
+| 200 | 151,741 ops/sec | 1.19ms | 2.96ms |
+
+**The fsync policy tradeoff, quantified** (same workload, concurrency 50,
+AOF enabled):
+
+| Policy | Throughput | p50 latency | p99 latency |
+|---|---|---|---|
+| `always` | 732 ops/sec | 580µs | 150.7ms |
+| `everysec` | 128,284 ops/sec | 320µs | 1.44ms |
+
+`always` is **~175x slower** — every single write blocks on a real disk
+sync. This is exactly the cost [documented as a design tradeoff](docs/DESIGN.md#persistence-append-only-file)
+before it was ever measured; now there's a number behind the claim.
+
+**The cost of replicating to one follower** (same workload, concurrency
+50, `fsync=everysec`):
+
+| Setup | Throughput |
+|---|---|
+| Leader alone | 132,379 ops/sec |
+| Leader + 1 follower | 118,419 ops/sec |
+
+About a **10% throughput cost** to keep one follower live-synced —
+reasonable given a replicated write means encoding the command once more
+and pushing it through a channel, on top of the AOF append every write
+already does.
+
+Reproduce any of these yourself:
+
+```bash
+go build -o bin/mini-redis-go ./cmd/server && go build -o bin/bench ./cmd/bench
+./bin/mini-redis-go -addr :6380 -aof ""          # disable persistence for a clean baseline
+./bin/bench -addr 127.0.0.1:6380 -c 50 -n 100000 -keyspace 10000 -get-ratio 0.5
+```
+
 ## Roadmap
 
 This was scoped as a multi-weekend project; commands/storage above are
@@ -199,8 +253,7 @@ milestone 1. Next up, in order:
 - [x] **Persistence** — append-only file (AOF) writer + replay on startup
 - [x] **Replication** — single leader, N followers, full sync + streamed
       writes, with a reported replication offset
-- [ ] **Benchmarks** — throughput/latency numbers via `redis-benchmark`,
-      published in this README once measured
+- [x] **Benchmarks** — throughput/latency numbers, published above
 - [ ] **LRU eviction** — approximate LRU under a configured max-memory limit
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the reasoning behind what's built

@@ -186,15 +186,49 @@ writes.
 
 See the [README roadmap](../README.md#roadmap) for the milestone order.
 
-## Benchmarking plan
+## Benchmarking methodology
 
-With persistence and replication both in place, the plan is to measure with
-`redis-benchmark` (ships with real Redis) against this server:
+**Why a custom tool ([cmd/bench](../cmd/bench)) instead of real Redis's
+`redis-benchmark`.** The obvious choice would be installing real Redis and
+pointing its own benchmark tool at this server. That wasn't available in
+the environment this was built in, and depending on it would mean the
+numbers in the README aren't reproducible by someone who clones this repo
+without also installing Redis separately. Writing a small load generator
+instead means `go build ./cmd/bench && ./bench ...` reproduces every number
+in the README with nothing but this repo — and it's one more consumer of
+the shared `resp` package (request encoding and reply decoding are the same
+`resp.EncodeCommand`/`resp.Reader.ReadValue` the server, AOF, and
+replication code already use), rather than new protocol code written a
+fifth time.
 
-- Throughput (ops/sec) for `SET`/`GET` at increasing concurrency
-- p50/p99 latency
-- Throughput impact of synchronous vs. async replication once a follower is
-  attached
+**What it measures and how.** Each of `-c` concurrent goroutines opens its
+own connection and issues requests **sequentially** — write a command, wait
+for the reply, then the next — matching how a single real client actually
+behaves (no pipelining). Per-request latency is the wall-clock time between
+writing the request and finishing the read of its reply. Percentiles are
+computed by sorting all latencies from every worker after the run and
+indexing by rank — nearest-rank, not a streaming quantile sketch, which is
+fine for reporting to two significant figures and not worth the complexity
+of something like t-digest at this scale.
 
-Numbers go in the README once measured — no fabricated benchmarks in the
-meantime.
+**What the numbers do and don't tell you.** The benchmark client and the
+server under test ran on the same machine, competing for the same CPU
+cores over a loopback connection. That's a legitimate way to compare
+configurations *against each other* (fsync policy A vs. B, replica
+attached vs. not — both measured under identical conditions, so the
+relative difference is real), but it is **not** a clean measurement of the
+server's absolute ceiling the way running the client on a separate
+physical machine would be. Take the relative comparisons (the ~175x fsync
+gap, the ~10% replication cost) as the trustworthy findings; take the raw
+ops/sec numbers as "in this ballpark on this machine," not a portable
+performance claim.
+
+**The fsync result is the one worth understanding, not just quoting.**
+`fsync=always` measured at 732 ops/sec against `everysec`'s 128,284 — a
+~175x gap — because `AOF.AppendEncoded` holds a single mutex for the
+duration of the `fsync` syscall itself (see [persistence](#persistence-append-only-file)),
+so with `always`, every one of 50 concurrent workers' writes serializes
+through one lock *and* a real disk sync, one at a time. That's not a bug —
+it's the direct, measurable cost of the durability guarantee `always` is
+supposed to provide, and it's exactly why `everysec` is the default both
+here and in real Redis.

@@ -110,10 +110,10 @@ point was to build the pieces, not wire up someone else's.
   byte length, so it can contain `\r\n` or arbitrary bytes), not
   newline-delimited — the parser reads exactly the declared number of
   bytes rather than scanning for a delimiter.
-- **One encoder, three consumers:** `resp.EncodeCommand` is used to build
-  the bytes for a live reply, an AOF log entry, and a replication broadcast
-  — the same framing everywhere, encoded once per command rather than
-  three separate ad hoc implementations.
+- **One encoder, four consumers:** `resp.EncodeCommand` builds the bytes
+  for a live reply, an AOF log entry, a replication broadcast, and the
+  benchmark tool's requests — the same framing everywhere, encoded once
+  per command rather than four separate ad hoc implementations.
 
 ### Testing strategy
 - **The pyramid:** unit tests per package (protocol parsing, store logic in
@@ -127,6 +127,30 @@ point was to build the pieces, not wire up someone else's.
   small `eventually(t, timeout, cond)` poll helper instead of a fixed
   `time.Sleep` — more reliable and faster than guessing a sleep duration,
   and it's a pattern worth knowing generally for testing async systems.
+
+### Benchmarking
+*(code: [cmd/bench](../cmd/bench), methodology: [DESIGN.md](DESIGN.md#benchmarking-methodology))*
+
+- **Built a load generator instead of depending on real Redis's
+  `redis-benchmark`** — keeps every number in the README reproducible by
+  anyone who clones the repo, with no external install, and it's one more
+  real consumer of the shared `resp` package rather than throwaway script
+  code.
+- **The one number worth being able to explain, not just recite:**
+  `fsync=always` measured ~175x slower than `everysec` (732 vs. 128,284
+  ops/sec). Why: `AOF.AppendEncoded` holds one mutex across the entire
+  `fsync` syscall, so with `always`, every concurrent writer serializes
+  through one lock *and* a real disk sync, one at a time. That's the
+  direct, now-measured cost of the durability guarantee `always` promises
+  — good evidence that the earlier design tradeoff writeup wasn't just
+  hand-waving.
+- **Be upfront about the methodology's limits if asked:** client and
+  server shared one machine's CPU cores over loopback, so the raw ops/sec
+  numbers are "this ballpark on this machine," not a portable performance
+  claim — but the *relative* comparisons (fsync gap, ~10% replication
+  cost) are measured under identical conditions each time, so those
+  differences are trustworthy. Saying this proactively reads as rigor, not
+  as undermining your own numbers.
 
 ## Bugs found & fixed (concrete stories for "tell me about a bug you found")
 
