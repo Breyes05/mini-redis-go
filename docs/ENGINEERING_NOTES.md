@@ -100,6 +100,42 @@ point was to build the pieces, not wire up someone else's.
   tracking — a slow or dead replica is just dropped (`Hub.Broadcast`)
   rather than applying backpressure to writes.
 
+### LRU eviction under a memory budget
+*(code: [internal/store/store.go](../internal/store/store.go))*
+
+- **The constraint that drives the whole design:** an exact LRU needs to
+  update a recency structure on every `Get`, which means every `Get` needs
+  a write lock — directly undoing the sharded `RWMutex` design built
+  earlier specifically so concurrent reads don't block each other. Real
+  Redis's `allkeys-lru` sidesteps this the same way: sample a few random
+  keys, evict whichever was used longest ago, rather than track exact
+  order.
+- **The refactor this forced:** entries had to move from being stored as
+  plain struct values in the map to `*entry` pointers, so `Get` can update
+  a `lastAccess` field via `atomic.Int64.Store` *after releasing the read
+  lock* — no lock needed for that update at all, since it's a pointer to a
+  stable object rather than a copy sitting in the map.
+- **A correctness bug worth being able to explain:** with a large keyspace,
+  5 random shard picks (out of 16) reliably land on different real keys.
+  With a *small* keyspace, they can just as reliably miss the few
+  occupied shards entirely — and naively treating "sampling found nothing"
+  as "nothing to evict" would leave the store stuck over budget forever in
+  that case. Fixed with a fallback that scans every shard (not just 5)
+  when random sampling comes back empty, so eviction only gives up when the
+  store is verifiably empty, not when it just got unlucky.
+- **Byte accounting is admittedly an estimate** (`len(key)+len(value)` plus
+  a flat per-entry overhead guess), not real memory measurement — worth
+  saying plainly rather than implying Go exposes exact heap accounting per
+  map entry, because it doesn't.
+- **Testing something probabilistic:** the "hot keys survive eviction more
+  than cold keys" test failed about 1 run in 30 during development — not
+  because the mechanism was wrong, but because the test's own eviction
+  pressure was so aggressive it sometimes wiped both groups down to zero
+  survivors, a tie that a strict `<=` comparison misread as failure. Fixed
+  by dialing back the pressure and changing the failure condition to "cold
+  clearly beat hot" instead of "hot didn't strictly win" — a good example
+  of a flaky test being a test-design bug, not a hint to just add a retry.
+
 ### Protocol design (RESP)
 *(code: [internal/resp/resp.go](../internal/resp/resp.go))*
 
@@ -183,6 +219,27 @@ leader had already processed some writes.**
   bug" — both showed up as the same red X, but they needed different fixes
   and only one of them was actually about replication correctness.
 
+**3. A flaky eviction test — again a test-design bug, not a production one.**
+- *Symptom:* `TestMaxMemory_PrefersEvictingLeastRecentlyUsed` failed
+  roughly 1 run in 30, always with both "hot" and "cold" survivor counts
+  at zero.
+- *Root cause:* the test's own eviction pressure was tuned so aggressively
+  (forcing out ~2/3 of the keyspace) that it sometimes wiped both groups
+  down to zero survivors — a tie — which the assertion (`survivingHot <=
+  survivingCold` treated as failure) misread as evidence the LRU mechanism
+  wasn't preferring hot keys, when actually both groups had simply been
+  annihilated by an overly harsh test setup.
+- *Fix:* two changes — reduced the forced eviction to about half the
+  keyspace so a real split is visible in the normal case, and changed the
+  failure condition to "cold keys clearly did *better* than hot" (the one
+  outcome that actually contradicts the mechanism) instead of "hot didn't
+  strictly beat cold." Verified with 100 repeated runs post-fix, 0
+  failures, versus 1/30 before.
+- *Why it's worth mentioning:* the instinct when a test is flaky is often
+  "add a retry" or "loosen a sleep." Here the right fix was recognizing
+  the *test's* pressure parameters and comparison operator were both
+  wrong, not the code under test.
+
 ## Anticipated questions & prepared answers
 
 **Q: Walk me through what happens when a client sends `SET foo bar EX 60`.**
@@ -208,6 +265,14 @@ oversight I'd hide from.
 A: `REPLOFFSET` on both sides — the difference between the leader's and a
 follower's reported offset is a concrete number of bytes of lag, not a
 guess.
+
+**Q: How does eviction decide what to remove, and why not exact LRU?**
+A: It samples 5 random keys and evicts whichever was read longest ago,
+rather than maintaining an exact recency-ordered structure — because
+updating exact order on every read would mean every `Get` needs a write
+lock, undoing the sharded-`RWMutex` design that lets concurrent reads not
+block each other. Same tradeoff real Redis's `allkeys-lru` makes, for the
+same reason.
 
 **Q: What's missing that a production version would need?**
 A: Partial resync instead of always full-syncing on reconnect; write

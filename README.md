@@ -52,8 +52,12 @@ found, and tradeoffs in one skimmable reference.
   streams live writes; both sides report a byte-for-byte comparable
   replication offset, the same way real Redis's `FULLRESYNC` handshake
   works ([details](docs/DESIGN.md#replication-leader-follower))
+- **Approximate LRU eviction under a memory budget** — sampling a few
+  random keys and evicting the least-recently-used of the sample, the same
+  approach real Redis uses so reads don't need a lock just to track
+  recency ([details](docs/DESIGN.md#lru-eviction-under-a-memory-budget))
 - **Commands implemented:** `PING`, `ECHO`, `SET` (with `EX` seconds),
-  `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `REPLOFFSET`
+  `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `DBSIZE`, `REPLOFFSET`
 
 ## Architecture
 
@@ -115,6 +119,9 @@ directory and replays it on startup, so state survives a restart:
 - `-fsync always` syncs to disk after every write (durable, slower);
   `-fsync everysec` (default) batches syncs once a second, matching Redis's
   own default — see [the tradeoff writeup](docs/DESIGN.md#persistence-append-only-file)
+- `-maxmemory <bytes>` caps approximate memory usage; once exceeded, writes
+  trigger eviction of approximately-least-recently-used keys. Unset (or
+  `<= 0`) means unlimited, the default.
 
 Talk to it with `redis-cli` if you have it installed:
 
@@ -154,6 +161,24 @@ redis-cli -p 6380 REPLOFFSET      # bytes of writes broadcast so far
 redis-cli -p 6381 REPLOFFSET      # matches the leader's once caught up
 ```
 
+### Running with a memory budget
+
+```bash
+./bin/mini-redis-go -addr :6380 -maxmemory 1048576   # ~1MB
+```
+
+Once approximate usage crosses the budget, writes start evicting
+approximately-least-recently-used keys to make room:
+
+```bash
+redis-cli -p 6380 DBSIZE            # key count so far
+redis-cli -p 6380 SET foo bar       # if over budget, may evict something else first
+```
+
+There's no error and no rejected write when the budget is hit — eviction
+just quietly keeps the store under budget, the same way real Redis's
+`allkeys-lru` policy does.
+
 Run the test suite (includes an end-to-end test that opens a real TCP
 connection and exchanges raw RESP bytes):
 
@@ -187,6 +212,7 @@ docs/DESIGN.md         deeper design rationale and tradeoffs
 | `EXISTS` | `EXISTS key` | `1` or `0` |
 | `EXPIRE` | `EXPIRE key seconds` | Sets TTL on an existing key |
 | `TTL` | `TTL key` | Seconds left, `-1` if no TTL, `-2` if missing |
+| `DBSIZE` | `DBSIZE` | Total number of keys currently stored |
 | `REPLOFFSET` | `REPLOFFSET` | Bytes of replicated writes processed so far (not a real Redis command) |
 
 `SYNC` is also handled, but as an internal replica handshake rather than a
@@ -254,10 +280,11 @@ milestone 1. Next up, in order:
 - [x] **Replication** — single leader, N followers, full sync + streamed
       writes, with a reported replication offset
 - [x] **Benchmarks** — throughput/latency numbers, published above
-- [ ] **LRU eviction** — approximate LRU under a configured max-memory limit
+- [x] **LRU eviction** — approximate LRU under a configured max-memory limit
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the reasoning behind what's built
-so far and what each of these will involve.
+All four milestones are complete. See [docs/DESIGN.md](docs/DESIGN.md) and
+[docs/ENGINEERING_NOTES.md](docs/ENGINEERING_NOTES.md) for the reasoning
+behind each one.
 
 ## License
 

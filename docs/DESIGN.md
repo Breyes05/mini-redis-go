@@ -174,17 +174,75 @@ fire-and-forget from the leader's perspective — a slow or dead replica is
 simply dropped (see `Hub.Broadcast`) rather than causing backpressure on
 writes.
 
+## LRU eviction under a memory budget
+
+**The constraint that shapes this whole feature.** An *exact* LRU — a
+recency-ordered structure (like a doubly-linked list) that gets touched on
+every single read — needs a lock on every `Get`, because reading a key and
+updating "this was just used" are the same operation. But `Get` currently
+only takes a shard's `RWMutex.RLock` (see [concurrency](#concurrency-sharded-locks-over-a-single-global-mutex)),
+which is exactly what lets concurrent reads on the same shard proceed
+without blocking each other. Making every read also acquire a write lock to
+maintain exact recency ordering would silently undo that entire design.
+Real Redis's own `allkeys-lru` policy doesn't try to maintain exact
+ordering either — it samples a handful of random keys and evicts whichever
+one of the sample was accessed longest ago (`maxmemory-samples`, default
+5). This project makes the same tradeoff, for the same reason.
+
+**How recency is tracked without a write lock.** Each entry carries a
+`lastAccess atomic.Int64` (unix nanoseconds). `Get` reads the entry pointer
+under `RLock`, releases the lock, and *then* calls `lastAccess.Store(...)`
+— no lock held at all for that update, because it's an atomic write to a
+field on an object nobody else needs exclusive access to. This only works
+because entries are stored as `*entry` (pointers) rather than plain structs
+in the map: a pointer stays valid and safely mutable via atomics even after
+the map itself changes around it, whereas updating a field on a struct
+*copy* would go nowhere. This was a real refactor this milestone required
+— every prior method that read `sh.data[key]` as a value had to change to
+work with pointers instead.
+
+**Sampling, concretely.** `evictOneSampled` picks `evictionSamples` (5)
+random shards, takes whichever key each shard's (Go-randomized) map
+iteration visits first, and deletes the one with the oldest `lastAccess`
+among that sample. With a large keyspace spread across 16 shards, 5 random
+draws almost always land on 5 different, meaningfully random keys — cheap
+and good enough. With a *small* keyspace, though, 5 random shard picks can
+easily miss the few shards that actually hold data (e.g., 2 keys spread
+across 16 shards — a 5-draw sample has better than even odds of hitting
+neither). Left unhandled, that would make eviction incorrectly give up
+("nothing to evict") while a key genuinely exists. The fix:
+`sampleEveryShard` is a fallback that visits all 16 shards instead of just
+5, guaranteeing a hit if the store isn't completely empty — used only when
+the fast random path comes back empty, so it doesn't cost anything in the
+common case.
+
+**Byte accounting is an estimate, not a measurement.** Each entry's `size`
+is `len(key) + len(value) + a constant overhead guess (48 bytes)`. Go
+doesn't expose exact per-entry heap accounting (map bucket overhead,
+pointer sizes, allocator padding), so this is deliberately approximate —
+the point is to make a memory *budget* mean something and behave
+consistently, not to match `RSS` byte-for-byte. Worth saying plainly if
+asked, rather than implying more precision than exists.
+
+**Why eviction is checked from `Set`, not from a background loop.** Similar
+to the active expiry sweep, a background eviction loop was considered —
+but eviction only needs to happen in response to something adding bytes, so
+checking synchronously right after each `Set` (which is also where
+`usedBytes` gets updated) means the budget is enforced immediately rather
+than for however long it takes a ticker to notice. The cost: a `Set` that
+pushes the store over budget pays for its own eviction inline rather than
+returning immediately — a legitimate alternative worth naming if asked
+"how would you make this not block the writer."
+
 ## What's deliberately not built yet
 
-- **LRU eviction:** once a max-memory config exists, evict on write when
-  over budget. Real Redis uses *approximated* LRU — sample a handful of
-  random keys and evict the oldest of the sample, rather than maintaining an
-  exact recency-ordered list — because an exact LRU structure would need a
-  global lock on every read (to update recency), which defeats the sharding
-  above. Worth implementing the approximation, not the exact version, and
-  explaining why.
-
-See the [README roadmap](../README.md#roadmap) for the milestone order.
+Nothing from the original roadmap — persistence, replication, benchmarks,
+and LRU eviction are all in. If extended further, the natural next
+additions would be: partial resync for replication (see above), a real
+`OBJECT IDLETIME`-style command to inspect a key's recency directly instead
+of only observing eviction behavior indirectly, and eviction *policies*
+beyond `allkeys-lru` (e.g. `volatile-lru`, evicting only keys with a TTL
+set, or `allkeys-random`).
 
 ## Benchmarking methodology
 

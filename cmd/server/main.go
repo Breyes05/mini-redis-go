@@ -16,10 +16,12 @@ func main() {
 	aofPath := flag.String("aof", "appendonly.aof", "append-only file path (empty disables persistence)")
 	fsync := flag.String("fsync", "everysec", "fsync policy for the AOF: 'always' or 'everysec'")
 	replicaOf := flag.String("replicaof", "", "leader address (host:port) to replicate from; empty runs standalone")
+	maxMemory := flag.Int64("maxmemory", 0, "approximate memory budget in bytes; evicts least-recently-used keys once exceeded (<= 0 disables the limit)")
 	flag.Parse()
 
 	st := store.New()
 	defer st.Close()
+	st.SetMaxMemory(*maxMemory)
 
 	srv := server.New(*addr, st)
 

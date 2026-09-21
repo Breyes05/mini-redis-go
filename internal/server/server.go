@@ -234,6 +234,11 @@ func (s *Server) dispatch(args []string, w *resp.Writer, internal bool) error {
 		return w.WriteInteger(0)
 	case "EXPIRE":
 		return s.handleExpire(args, w)
+	case "DBSIZE":
+		if len(args) != 1 {
+			return w.WriteError("ERR wrong number of arguments for 'dbsize' command")
+		}
+		return w.WriteInteger(int64(s.store.KeyCount()))
 	case "TTL":
 		if len(args) != 2 {
 			return w.WriteError("ERR wrong number of arguments for 'ttl' command")

@@ -86,6 +86,17 @@ func TestServer_PingSetGetDel(t *testing.T) {
 	sendAndExpect(t, conn, "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n", "$-1\r\n")
 }
 
+func TestServer_DBSIZE(t *testing.T) {
+	conn := startTestServer(t)
+
+	sendAndExpect(t, conn, "*1\r\n$6\r\nDBSIZE\r\n", ":0\r\n")
+	sendAndExpect(t, conn, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", "+OK\r\n")
+	sendAndExpect(t, conn, "*3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$3\r\nqux\r\n", "+OK\r\n")
+	sendAndExpect(t, conn, "*1\r\n$6\r\nDBSIZE\r\n", ":2\r\n")
+	sendAndExpect(t, conn, "*2\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n", ":1\r\n")
+	sendAndExpect(t, conn, "*1\r\n$6\r\nDBSIZE\r\n", ":1\r\n")
+}
+
 func TestServer_ExpireAndTTL(t *testing.T) {
 	conn := startTestServer(t)
 
